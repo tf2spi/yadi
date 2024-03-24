@@ -19,7 +19,7 @@ BOOL WINAPI DllMain(
 					char name[260];
 					if (GetModuleFileNameA(hMods[i], name, sizeof(name)))
 					{
-						fprintf(stderr, "Mod name: %s\n", name);
+						fprintf(stderr, "Mod name,ptr: %s,%p\n", name, hMods[i]);
 					}
 				}
 			}
