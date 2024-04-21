@@ -5,13 +5,37 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <assert.h>
 
-static DWORD WINAPI itworks(void *unused)
+struct ImageBase {};
+#ifdef __cplusplus
+extern "C" struct ImageBase __ImageBase;
+#else
+extern struct ImageBase __ImageBase;
+#endif
+
+// Target Begin
+struct TargetTable
 {
-	(void)unused;
-	return 1337;
+	HMODULE (WINAPI *lpLoadLibraryA)(LPCSTR);
+	BOOL (WINAPI *lpFreeLibrary)(HMODULE);
+	DWORD (WINAPI *lpGetLastError)(void);
+	HMODULE *lpModules;
+};
+static struct TargetTable target;
+
+// TODO: Inject all DLLs in ARGV
+// TODO: If a DLL fails to get injected, consider returning (index of DLL + 1)
+// TODO: If a DLL fails to get injected, consider not unloading earlier DLLs
+// TODO: If a DLL fails to get injected, it should be cleaned up to avoid leaks on attach
+DWORD TargetMain(const char **argv)
+{
+	return 0;
 }
 
+// Target End
+
+// Injector Begin
 enum log_level
 {
 	LL_DEBUG = 0,
@@ -48,27 +72,42 @@ static void log(int level, const char *func, int line, const char *fmt, ...)
 #define WARNF(...) log(LL_WARN, __FUNCTION__, __LINE__, __VA_ARGS__)
 #define ERRF(...) log(LL_ERR, __FUNCTION__, __LINE__, __VA_ARGS__)
 
-HMODULE LoadLibraryRemoteA(HANDLE hProcess, const char *lpLibName)
+static BOOL ProcessRPC(HANDLE hProcess, LPTHREAD_START_ROUTINE routine, LPVOID data, DWORD *pdwExitCode)
 {
-	HMODULE hModule = NULL;
-	HANDLE hThread = NULL;
-	HMODULE *lphModules = NULL;
-	char *lpLibNameFull = NULL;
-	size_t cbLibName = strlen(lpLibName) + 1;
-	char *lpRemoteName = (char *)VirtualAllocEx(
+	HANDLE hThread = CreateRemoteThread(
 		hProcess,
 		NULL,
-		cbLibName,
-		MEM_COMMIT | MEM_RESERVE,
-		PAGE_READWRITE
-	);
+		0,
+		routine,
+		data,
+		0,
+		NULL);
+	if (hThread == NULL)
+	{
+		ERRF("Failed to create remote thread for calling function %p! %d",
+				GetLastError());
+		return FALSE;
+	}
+	WaitForSingleObject(hThread, INFINITE);
+	BOOL success = TRUE;
+	if (pdwExitCode != NULL)
+	{
+		success = GetExitCodeThread(hThread, pdwExitCode);
+	}
+	CloseHandle(hThread);
+	return success;
+}
+
+HMODULE LoadLibraryRemoteA(HANDLE hProcess, const char *lpLibName, HMODULE **ppModules, DWORD *pdwModules)
+{
+	HMODULE hModule = NULL;
 
 	DWORD lpLibNameFullLen = GetFullPathNameA(
 			lpLibName,
 			0,
 			NULL,
 			NULL);
-	lpLibNameFull = (char *)malloc(lpLibNameFullLen + 1);
+	char *lpLibNameFull = (char *)malloc(lpLibNameFullLen + 1);
 	if (lpLibNameFull == NULL 
 		|| !GetFullPathNameA(
 			lpLibName,
@@ -78,47 +117,44 @@ HMODULE LoadLibraryRemoteA(HANDLE hProcess, const char *lpLibName)
 	{
 		ERRF("Failed to get full path of the library! %d",
 				GetLastError());
-		goto load_done;
+		goto getfullpath_failed;
 	}
 
+	char *lpRemoteName = (char *)VirtualAllocEx(
+		hProcess,
+		NULL,
+		lpLibNameFullLen + 1,
+		MEM_COMMIT | MEM_RESERVE,
+		PAGE_READWRITE
+	);
 	if (lpRemoteName == NULL)
 	{
 		ERRF("Failed to allocate memory in remote process! %d",
 				GetLastError());
-		goto load_done;
+		goto vallocex_failed;
 	}
-	if (!WriteProcessMemory(hProcess, lpRemoteName, lpLibName, cbLibName, NULL))
+
+	if (!WriteProcessMemory(hProcess, lpRemoteName, lpLibName, lpLibNameFullLen + 1, NULL))
 	{
 		ERRF("Failed to write library name in remote process! %d",
 				GetLastError());
-		goto load_done;
+		goto loadlibrary_failed;
 	}
 
-	hThread = CreateRemoteThread(
-			hProcess,
-			NULL,
-			0,
-			(LPTHREAD_START_ROUTINE)LoadLibraryA,
-			lpRemoteName,
-			0,
-			NULL);
-	if (hThread == NULL)
+	if (!ProcessRPC(hProcess, (LPTHREAD_START_ROUTINE)LoadLibraryA, lpRemoteName, NULL))
 	{
-		ERRF("Failed to create remote thread for LoadLibrary! %d",
-				GetLastError());
-		goto load_done;
+		ERRF("RPC call to LoadLibrary failed!\n");
+		goto loadlibrary_failed;
 	}
-	INFOF("Waiting for remote thread to finish...");
-	WaitForSingleObject(hThread, INFINITE);
 
 	DWORD cbNeeded = 0;
 	EnumProcessModules(hProcess, NULL, 0, &cbNeeded);
-	lphModules = (HMODULE *)malloc(cbNeeded);
+	HMODULE *lphModules = (HMODULE *)malloc(cbNeeded);
 	if (lphModules == NULL || !EnumProcessModules(hProcess, lphModules, cbNeeded, &cbNeeded))
 	{
 		ERRF("Failed to enumerate all the process modules! %d",
 				GetLastError());
-		goto load_done;
+		goto enummodules_failed;
 	}
 
 	DWORD dwModules = cbNeeded / sizeof(HMODULE);
@@ -140,30 +176,137 @@ HMODULE LoadLibraryRemoteA(HANDLE hProcess, const char *lpLibName)
 			DEBUGF("Found module in target! %s %p",
 					szCurrentModName, hCurrentMod);
 			hModule = hCurrentMod;
-			goto load_done;
+			break;
 		}
 	}
+
 	if (hModule == NULL)
 	{
 		ERRF("Failed to find injected library in target!");
 		SetLastError(ERROR_NOT_FOUND);
-		goto load_done;
+	}
+	else if (ppModules != NULL && pdwModules != NULL)
+	{
+		*pdwModules = dwModules;
+		*ppModules = lphModules;
+		dwModules = 0;
+		lphModules = NULL;
 	}
 
-load_done:
-	if (lpRemoteName != NULL)
-		VirtualFreeEx(hProcess, lpRemoteName, 0, MEM_RELEASE);
-	if (hThread != NULL)
-		CloseHandle(hThread);
-	if (lphModules != NULL)
-		free(lphModules);
-	if (lpLibNameFull != NULL)
-		free(lpLibNameFull);
-
+enummodules_failed:
+	free(lphModules);
+loadlibrary_failed:
+	VirtualFreeEx(hProcess, lpRemoteName, 0, MEM_RELEASE);
+vallocex_failed:
+getfullpath_failed:
+	free(lpLibNameFull);
 	return hModule;
 }
 
-static int injector_main(HANDLE hProcess, char **ppDllNames, int iDllCount)
+static LPCVOID TargetTranslate(HMODULE hSelfRemote, LPCVOID pSelfVA)
+{
+	return (LPCVOID)((uintptr_t)hSelfRemote - (uintptr_t)&__ImageBase + (uintptr_t)pSelfVA);
+}
+
+static BOOL TargetInit(HANDLE hProcess, HMODULE hSelfRemote, HMODULE *lpModules, DWORD dwModules)
+{
+	target.lpLoadLibraryA = LoadLibraryA;
+	target.lpFreeLibrary = FreeLibrary;
+	target.lpGetLastError = GetLastError;
+
+	assert(SIZE_MAX / sizeof(*lpModules) >= dwModules);
+	size_t cbModules = sizeof(*lpModules) * dwModules;
+	LPVOID lpModulesRemote = VirtualAllocEx(
+			hProcess,
+			NULL,
+			cbModules,
+			MEM_COMMIT | MEM_RESERVE,
+			PAGE_READWRITE);
+	if (lpModulesRemote == NULL)
+	{
+		ERRF("Failed to allocate memory for storing modules on target! %d",
+				GetLastError());
+		return FALSE;
+	}
+	target.lpModules = (HMODULE *)lpModulesRemote;
+
+	struct TargetTable *lpTargetRemote = (struct TargetTable *)TargetTranslate(hSelfRemote, &target);
+	if (!WriteProcessMemory(hProcess, lpModulesRemote, lpModules, cbModules, NULL)
+		|| !WriteProcessMemory(hProcess, lpTargetRemote, &target, sizeof(target), NULL))
+	{
+		ERRF("Failed to write to remote target! %d",
+				GetLastError());
+		VirtualFreeEx(hProcess, lpModulesRemote, 0, MEM_RELEASE);
+		target.lpModules = NULL;
+		return FALSE;
+	}
+	DEBUGF("Target initialized!");
+	return TRUE;
+}
+
+static const char **CreateRemoteArgv(HANDLE hProcess, int argc, const char **argv)
+{
+	assert(argc >= 0 && ((SIZE_MAX / sizeof(*argv)) - 1u) >= (size_t)argc);
+
+	size_t cbNeeded = sizeof(*argv) * (argc + 1);
+	size_t iArgvStart = cbNeeded;
+	for (int i = 0; i < argc; i++)
+	{
+		size_t slen = strlen(argv[i]);
+		assert(SIZE_MAX - slen > cbNeeded);
+		cbNeeded += (slen + 1);
+	}
+
+	char **tmp = (char **)malloc(cbNeeded);
+	if (tmp == NULL)
+	{
+		ERRF("Failed to allocate memory for local argv!\n");
+		return NULL;
+	}
+	tmp[argc] = NULL;
+	char *iter = (char *)tmp + iArgvStart;
+	for (int i = 0; i < argc; i++)
+	{
+		const char *arg = argv[i];
+		size_t len = strlen(arg) + 1;
+		memcpy(iter, arg, len);
+		tmp[i] = iter;
+		iter += len;
+	}
+
+	LPVOID lpRemote = VirtualAllocEx(
+		hProcess,
+		NULL,
+		cbNeeded,
+		MEM_COMMIT | MEM_RESERVE,
+		PAGE_READWRITE
+	);
+	if (lpRemote == NULL)
+	{
+		free(tmp);
+		ERRF("Failed to allocate memory for remote argv! %d\n");
+		return NULL;
+	}
+
+	BOOL success = WriteProcessMemory(hProcess, lpRemote, tmp, cbNeeded, NULL);
+	free(tmp);
+	tmp = NULL;
+	cbNeeded = 0;
+	if (!success)
+	{
+		VirtualFreeEx(hProcess, lpRemote, 0, MEM_RELEASE);
+		ERRF("Failed to write local argv to remote argv! %d",
+				GetLastError());
+		return NULL;
+	}
+
+	return (const char **)lpRemote;
+}
+
+// This function should always clean up any remote resources
+// it allocates so that the other process can have as much
+// memory as possible after the injection.
+static int InjectorMain(HANDLE hProcess, char **ppDllNames, int iDllCount)
 {
 	char szExeName[MAX_PATH];
 	if (GetModuleFileNameA(NULL, szExeName, sizeof(szExeName))
@@ -174,59 +317,51 @@ static int injector_main(HANDLE hProcess, char **ppDllNames, int iDllCount)
 		return EXIT_FAILURE;
 	}
 
-	HMODULE hModuleExe = LoadLibraryRemoteA(hProcess, szExeName);
+	HMODULE *lpModulesRemote;
+	DWORD dwModules;
+	HMODULE hModuleExe = LoadLibraryRemoteA(hProcess, szExeName, &lpModulesRemote, &dwModules);
 	if (hModuleExe == NULL)
 	{
 		ERRF("Failed to load ourselves remotely in process! %d",
 			GetLastError());
 		return EXIT_FAILURE;
 	}
-	DEBUGF("We did the thing! We loaded ourselves! %p",
-		hModuleExe);
+	DEBUGF("We did the thing! We loaded ourselves! Local:%p Remote:%p",
+		&__ImageBase, hModuleExe);
 
-	DEBUGF("Confirming loading worked!");
-	DWORD dwOffset = (ULONG_PTR)itworks - (ULONG_PTR)GetModuleHandle(NULL);
-	LPTHREAD_START_ROUTINE itworks_ptr = (LPTHREAD_START_ROUTINE)
-		((ULONG_PTR)hModuleExe + dwOffset);
-	HANDLE hDumbThread = CreateRemoteThread(
-			hProcess,
-			NULL,
-			0,
-			itworks_ptr,
-			NULL,
-			0,
-			NULL);
-	if (hDumbThread != NULL)
+	BOOL success = TargetInit(hProcess, hModuleExe, lpModulesRemote, dwModules);
+	free(lpModulesRemote);
+	lpModulesRemote = NULL;
+	dwModules = 0;
+	DWORD iExitCode = EXIT_FAILURE;
+	if (success)
 	{
-		WaitForSingleObject(hDumbThread, INFINITE);
-		DWORD dwExitCode;
-		if (GetExitCodeThread(hDumbThread, &dwExitCode))
+		const char **ppRemoteArgv = CreateRemoteArgv(hProcess, iDllCount, (const char **)ppDllNames);
+		if (ppRemoteArgv != NULL)
 		{
-			DEBUGF("It worked: %u\n", dwExitCode);
+			if (!ProcessRPC(hProcess,
+				(LPTHREAD_START_ROUTINE)TargetTranslate(hModuleExe, TargetMain),
+				ppRemoteArgv,
+				&iExitCode))
+			{
+				iExitCode = EXIT_FAILURE;
+			}
+			VirtualFreeEx(hProcess, ppRemoteArgv, 0, MEM_RELEASE);
 		}
-		else
-		{
-			ERRF("Failed to get its exit code :(. %d\n",
-					GetLastError());
-		}
+		VirtualFreeEx(hProcess, target.lpModules, 0, MEM_RELEASE);
 	}
 	else
 	{
-		ERRF("Failed to start thread testing itworks! %d",
-				GetLastError());
+		ERRF("But in the end, it doesn't even matter!");
 	}
 
-	for (int i = 0; i < iDllCount; i++)
+	// Not really necessary but it makes the DLL list cleaner
+	// and frees up some memory in the remote process
+	if (!ProcessRPC(hProcess, (LPTHREAD_START_ROUTINE)FreeLibrary, hModuleExe, NULL))
 	{
-		const char *dllname = ppDllNames[i];
-		DEBUGF("Injecting '%s'...", dllname);
-		if (LoadLibraryRemoteA(hProcess, dllname) == NULL)
-		{
-			ERRF("Failed to load library! I dunno why!");
-			continue;
-		}
+		WARNF("RPC call to FreeLibrary failed? Strange but not fatal!");
 	}
-	return EXIT_SUCCESS;
+	return (int)iExitCode;
 }
 
 int main(int argc, char **argv)
@@ -243,6 +378,8 @@ int main(int argc, char **argv)
 	si.cb = sizeof(si);
 	ZeroMemory(&pi, sizeof(pi));
 
+	// TODO: Consider detecting if a process ID is given or not
+	//       and give the user the option to attach to a process
 	DEBUGF("Starting with command '%s'!", lpCmdLine);
 	if (!CreateProcess(NULL,
 		lpCmdLine,
@@ -259,7 +396,16 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	int iExitCode = injector_main(pi.hProcess, &argv[1], argc - 2);
+	int iExitCode = InjectorMain(pi.hProcess, &argv[1], argc - 2);
+	if (iExitCode != EXIT_SUCCESS)
+	{
+		// TODO: On failure, if we attach to a process,
+		//       we should not terminate it.
+		ERRF("Injection was unsuccessful! :(");
+		TerminateProcess(pi.hProcess, iExitCode);
+		return iExitCode;
+	}
+	INFOF("Injection successful! Yaaaaaaaaaaaaaaay!");
 	ResumeThread(pi.hThread);
 
 	// TODO: Don't wait for process to finish when building release
@@ -268,3 +414,4 @@ int main(int argc, char **argv)
 	WaitForSingleObject(pi.hProcess, INFINITE);
 	return iExitCode;
 }
+// Injector End
