@@ -24,15 +24,22 @@ struct TargetTable
 };
 static struct TargetTable target;
 
-// TODO: Inject all DLLs in ARGV
-// TODO: If a DLL fails to get injected, consider returning (index of DLL + 1)
-// TODO: If a DLL fails to get injected, consider not unloading earlier DLLs
-// TODO: If a DLL fails to get injected, it should be cleaned up to avoid leaks on attach
 DWORD TargetMain(const char **argv)
 {
+	for (int i = 0; argv[i] != NULL; i++)
+	{
+		const char *dll = argv[i];
+		HMODULE hLib = target.lpLoadLibraryA(dll);
+
+		// If preloading a library fails, DO NOT unload other libraries
+		if (hLib == NULL)
+		{
+			return ~i;
+		}
+		// TODO: If a DLL fails to get injected, it should be cleaned up to avoid leaks on attach
+	}
 	return 0;
 }
-
 // Target End
 
 // Injector Begin
@@ -287,6 +294,10 @@ static const char **CreateRemoteArgv(HANDLE hProcess, int argc, const char **arg
 		ERRF("Failed to allocate memory for remote argv! %d\n");
 		return NULL;
 	}
+	for (int i = 0; i < argc; i++)
+	{
+		tmp[i] += ((uintptr_t)lpRemote - (uintptr_t)tmp);
+	}
 
 	BOOL success = WriteProcessMemory(hProcess, lpRemote, tmp, cbNeeded, NULL);
 	free(tmp);
@@ -339,6 +350,7 @@ static int InjectorMain(HANDLE hProcess, char **ppDllNames, int iDllCount)
 		const char **ppRemoteArgv = CreateRemoteArgv(hProcess, iDllCount, (const char **)ppDllNames);
 		if (ppRemoteArgv != NULL)
 		{
+			ppDllNames[iDllCount] = NULL;
 			if (!ProcessRPC(hProcess,
 				(LPTHREAD_START_ROUTINE)TargetTranslate(hModuleExe, TargetMain),
 				ppRemoteArgv,
@@ -354,9 +366,6 @@ static int InjectorMain(HANDLE hProcess, char **ppDllNames, int iDllCount)
 	{
 		ERRF("But in the end, it doesn't even matter!");
 	}
-
-	// Not really necessary but it makes the DLL list cleaner
-	// and frees up some memory in the remote process
 	if (!ProcessRPC(hProcess, (LPTHREAD_START_ROUTINE)FreeLibrary, hModuleExe, NULL))
 	{
 		WARNF("RPC call to FreeLibrary failed? Strange but not fatal!");
